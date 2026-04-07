@@ -39,7 +39,7 @@ class Settings(BaseSettings):
     DIRECT_URL: Optional[str] = None  # Supabase direct URL for migrations
 
     # CORS
-    CORS_ORIGINS: str = "http://localhost:3000,https://missing-tracker-person.onrender.com"
+    CORS_ORIGINS: str = "http://localhost:3000,https://missing-tracker-person.vercel.app,https://missing-tracker-person.onrender.com"
 
     def cors_origins_list(self) -> List[str]:
         """Parse comma-separated CORS origins into a clean list."""

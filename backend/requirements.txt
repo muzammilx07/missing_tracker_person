@@ -3,11 +3,9 @@ uvicorn[standard]==0.24.0
 
 Pillow==10.2.0
 numpy==1.26.4
-dlib-bin
-face-recognition==1.3.0
-git+https://github.com/ageitgey/face_recognition_models
+deepface==0.0.93
 
-opencv-python-headless
+opencv-python-headless==4.9.0.80
 
 sqlalchemy==2.0.23
 psycopg2-binary==2.9.9
@@ -20,6 +18,8 @@ email-validator==2.1.0
 
 cloudinary==1.36.0
 requests==2.31.0
+beautifulsoup4==4.12.2
+reportlab==4.0.7
 aiofiles==23.2.1
 httpx==0.25.2
 python-dotenv==1.0.0

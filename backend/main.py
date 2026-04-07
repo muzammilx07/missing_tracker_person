@@ -31,13 +31,12 @@ from auth import (
 )
 from services import (
     upload_photo, reverse_geocode, geocode_address, find_police_stations,
-    extract_encoding, run_face_match, get_confidence_label, match_against_open_cases,
+    extract_encoding, compare_encodings, run_face_match, get_confidence_label, match_against_open_cases,
     generate_fir_pdf, get_alert_recipients, log_alert, notify_match_found,
     notify_fir_sent, notify_case_opened, prepare_image_bytes_for_processing,
     log_memory_snapshot, warmup_face_models
 )
-from services.face_service import FACE_RECOGNITION_AVAILABLE
-from services.face_service import compare_encodings
+from services.face_service import FACE_ENGINE_AVAILABLE
 
 logger = logging.getLogger(__name__)
 
@@ -442,7 +441,7 @@ def validate_photo(
         log_memory_snapshot("validate_photo:prepared")
 
         # Use face encoding detector when available.
-        if FACE_RECOGNITION_AVAILABLE:
+        if FACE_ENGINE_AVAILABLE:
             encoding = extract_encoding(image_bytes)
             if encoding:
                 return {"is_person": True, "confidence": 0.92}
@@ -525,7 +524,7 @@ def create_case(
     """
     
     try:
-        if not FACE_RECOGNITION_AVAILABLE:
+        if not FACE_ENGINE_AVAILABLE:
             raise HTTPException(status_code=503, detail="Face recognition model not available")
 
         # Validate and preprocess to memory-efficient size before any heavy operation.
@@ -1003,7 +1002,7 @@ def create_sighting(
     """
     
     try:
-        if not FACE_RECOGNITION_AVAILABLE:
+        if not FACE_ENGINE_AVAILABLE:
             raise HTTPException(status_code=503, detail="Face recognition model not available")
 
         photo_bytes = prepare_image_bytes_for_processing(photo.file)
@@ -2114,7 +2113,7 @@ def test_match(
     image_b: UploadFile = File(...),
 ):
     """Test endpoint: compare two uploaded images using the same face pipeline."""
-    if not FACE_RECOGNITION_AVAILABLE:
+    if not FACE_ENGINE_AVAILABLE:
         raise HTTPException(status_code=503, detail="Face recognition model not available")
 
     bytes_a = image_a.file.read()

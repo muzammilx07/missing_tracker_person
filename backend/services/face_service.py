@@ -1,36 +1,33 @@
 """
-Face recognition service for detecting, encoding, and matching faces.
-Uses face_recognition library for accurate face detection and encoding.
-
-NOTE: face_recognition library has complex dependencies (dlib).
-On Windows: pip install face_recognition (should work)
-On Linux: May need: apt-get install cmake, then pip install dlib face_recognition
+Face recognition service implemented with DeepFace.
+Handles face preprocessing, embedding extraction, and matching.
 """
 
-import pickle
-import logging
-from typing import Optional, List, Dict, BinaryIO
 import gc
+import io
+import logging
+import pickle
 import threading
 import tracemalloc
-from sqlalchemy.orm import Session
-import numpy as np
+from typing import BinaryIO, Dict, List, Optional
 
-# Try to import optional dependencies
+import numpy as np
+from PIL import Image
+from sqlalchemy.orm import Session
+
 try:
-    import face_recognition
-    from PIL import Image
-    import io
-    FACE_RECOGNITION_AVAILABLE = True
-except ImportError as e:
-    FACE_RECOGNITION_AVAILABLE = False
-    print(f"[FACE] WARNING: face_recognition not available: {str(e)}")
+    from deepface import DeepFace
+    FACE_ENGINE_AVAILABLE = True
+except ImportError as exc:
+    FACE_ENGINE_AVAILABLE = False
+    print(f"[FACE] WARNING: DeepFace not available: {str(exc)}")
 
 from config import settings
-from models import Sighting, MissingPerson, Match, Case, Alert
+from models import Alert, Case, Match, MissingPerson, Sighting
 
 logger = logging.getLogger(__name__)
 
+FACE_MODEL_NAME = "Facenet"
 MAX_UPLOAD_BYTES = 5 * 1024 * 1024
 MAX_INPUT_DIMENSION = 2000
 PROCESSING_MAX_DIMENSION = 640
@@ -54,15 +51,14 @@ def log_memory_snapshot(stage: str) -> None:
             peak / (1024 * 1024),
         )
     except Exception:
-        # Memory telemetry must never interrupt request handling.
         pass
 
 
 def prepare_image_bytes_for_processing(file_obj: BinaryIO) -> bytes:
     """Validate and resize uploaded image into a compact RGB JPEG byte buffer."""
 
-    if not FACE_RECOGNITION_AVAILABLE:
-        raise ValueError("Face recognition dependencies are unavailable")
+    if not FACE_ENGINE_AVAILABLE:
+        raise ValueError("DeepFace dependencies are unavailable")
 
     try:
         file_obj.seek(0, 2)
@@ -106,38 +102,61 @@ def prepare_image_bytes_for_processing(file_obj: BinaryIO) -> bytes:
 
 
 def warmup_face_models() -> None:
-    """Warm dlib/face_recognition models once to avoid first-request memory spikes."""
+    """Warm DeepFace model once at startup to avoid first-request latency spikes."""
 
     global _MODELS_WARMED
 
-    if not FACE_RECOGNITION_AVAILABLE or _MODELS_WARMED:
+    if not FACE_ENGINE_AVAILABLE or _MODELS_WARMED:
         return
 
     with _MODEL_WARMUP_LOCK:
         if _MODELS_WARMED:
             return
         try:
-            sample = np.zeros((32, 32, 3), dtype=np.uint8)
-            face_recognition.face_locations(sample, number_of_times_to_upsample=0, model="hog")
+            sample = np.zeros((64, 64, 3), dtype=np.uint8)
+            DeepFace.represent(
+                img_path=sample,
+                model_name=FACE_MODEL_NAME,
+                detector_backend="opencv",
+                enforce_detection=False,
+            )
             _MODELS_WARMED = True
-            logger.info("[FACE] Model warmup complete")
+            logger.info("[FACE] DeepFace model warmup complete")
         except Exception as exc:
-            logger.warning(f"[FACE] Model warmup skipped: {str(exc)}")
+            logger.warning(f"[FACE] DeepFace warmup skipped: {str(exc)}")
+
+
+def _pick_largest_face(image_array: np.ndarray) -> Optional[np.ndarray]:
+    """Return the largest detected face crop from an image."""
+    faces = DeepFace.extract_faces(
+        img_path=image_array,
+        detector_backend="opencv",
+        enforce_detection=False,
+        align=True,
+    )
+
+    if not faces:
+        return None
+
+    best_face = max(
+        faces,
+        key=lambda face: int(face.get("facial_area", {}).get("w", 1)) * int(face.get("facial_area", {}).get("h", 1)),
+    )
+    face_img = best_face.get("face")
+    if face_img is None:
+        return None
+
+    # DeepFace can return float in [0,1]; convert to uint8 for consistent downstream behavior.
+    if face_img.dtype != np.uint8:
+        face_img = np.clip(face_img * 255.0, 0, 255).astype(np.uint8)
+    return face_img
 
 
 def extract_encoding(image_bytes: bytes) -> Optional[bytes]:
-    """
-    Extract face encoding from image bytes.
-    
-    Args:
-        image_bytes: Raw image file content
-    
-    Returns:
-        Pickled encoding (bytes), or None if no face found or lib not available
-    """
-    
-    if not FACE_RECOGNITION_AVAILABLE:
-        logger.warning("[FACE] face_recognition library not available")
+    """Extract a normalized face embedding from image bytes using DeepFace."""
+
+    if not FACE_ENGINE_AVAILABLE:
+        logger.warning("[FACE] DeepFace library not available")
         return None
 
     try:
@@ -149,46 +168,37 @@ def extract_encoding(image_bytes: bytes) -> Optional[bytes]:
                 image.thumbnail((PROCESSING_MAX_DIMENSION, PROCESSING_MAX_DIMENSION), Image.Resampling.BILINEAR)
 
             image_array = np.asarray(image, dtype=np.uint8)
-
-            # Single-pass detection with HOG and no upscaling avoids large temporary allocations.
-            face_locations = face_recognition.face_locations(
-                image_array,
-                number_of_times_to_upsample=0,
-                model="hog",
-            )
-
-            if not face_locations:
+            selected_face = _pick_largest_face(image_array)
+            if selected_face is None:
                 logger.info("[FACE] No face detected in image")
                 return None
 
-            if len(face_locations) > 1:
-                best_location = max(
-                    face_locations,
-                    key=lambda loc: (loc[2] - loc[0]) * (loc[1] - loc[3]),
-                )
-                logger.info(f"[FACE] Multiple faces found, using largest of {len(face_locations)}")
-            else:
-                best_location = face_locations[0]
+            representations = DeepFace.represent(
+                img_path=selected_face,
+                model_name=FACE_MODEL_NAME,
+                detector_backend="skip",
+                enforce_detection=False,
+            )
 
-            # Extract only one face encoding.
-            encodings = face_recognition.face_encodings(image_array, [best_location])
-
-            if not encodings:
-                logger.warning("[FACE] Could not extract encoding from face")
+            if not representations:
+                logger.info("[FACE] No embedding generated")
                 return None
 
-            encoding = np.asarray(encodings[0], dtype=np.float32)
+            embedding = np.asarray(representations[0].get("embedding", []), dtype=np.float32)
+            if embedding.size == 0:
+                logger.info("[FACE] Empty embedding generated")
+                return None
 
-            norm = np.linalg.norm(encoding)
+            norm = np.linalg.norm(embedding)
             if norm == 0:
                 logger.warning("[FACE] Invalid zero-norm embedding")
                 return None
-            encoding = encoding / norm
 
-            return pickle.dumps(encoding)
-    
-    except Exception as e:
-        logger.error(f"[FACE] Encoding extraction error: {str(e)}")
+            embedding = embedding / norm
+            return pickle.dumps(embedding)
+
+    except Exception as exc:
+        logger.error(f"[FACE] DeepFace extraction error: {str(exc)}")
         return None
     finally:
         try:
@@ -200,15 +210,15 @@ def extract_encoding(image_bytes: bytes) -> Optional[bytes]:
         except Exception:
             pass
         try:
-            del face_locations
+            del selected_face
         except Exception:
             pass
         try:
-            del encodings
+            del representations
         except Exception:
             pass
         try:
-            del encoding
+            del embedding
         except Exception:
             pass
         gc.collect()
@@ -216,55 +226,35 @@ def extract_encoding(image_bytes: bytes) -> Optional[bytes]:
 
 
 def compare_encodings(enc1_bytes: bytes, enc2_bytes: bytes) -> float:
-    """
-    Compare two face encodings.
-    
-    Args:
-        enc1_bytes: Pickled encoding 1
-        enc2_bytes: Pickled encoding 2
-    
-    Returns:
-        Cosine similarity score (-1.0 to 1.0), where higher = more similar
-    """
-    
-    if not FACE_RECOGNITION_AVAILABLE:
-        logger.warning("[FACE] face_recognition library not available")
-        return 0.0
-    
-    try:
-        enc1 = np.array(pickle.loads(enc1_bytes), dtype=np.float32)
-        enc2 = np.array(pickle.loads(enc2_bytes), dtype=np.float32)
+    """Compare two stored embeddings with cosine similarity."""
 
-        # Keep compatibility if old non-normalized embeddings exist in DB.
-        norm1 = np.linalg.norm(enc1)
-        norm2 = np.linalg.norm(enc2)
+    if not FACE_ENGINE_AVAILABLE:
+        logger.warning("[FACE] DeepFace library not available")
+        return 0.0
+
+    try:
+        emb1 = np.asarray(pickle.loads(enc1_bytes), dtype=np.float32)
+        emb2 = np.asarray(pickle.loads(enc2_bytes), dtype=np.float32)
+
+        norm1 = np.linalg.norm(emb1)
+        norm2 = np.linalg.norm(emb2)
         if norm1 == 0 or norm2 == 0:
             logger.warning("[FACE] Zero-norm embedding encountered during comparison")
             return 0.0
 
-        enc1 = enc1 / norm1
-        enc2 = enc2 / norm2
+        emb1 = emb1 / norm1
+        emb2 = emb2 / norm2
 
-        # True cosine similarity in [-1, 1].
-        cosine_similarity = float(np.dot(enc1, enc2))
-        return round(max(-1.0, min(1.0, cosine_similarity)), 4)
-    
-    except Exception as e:
-        logger.error(f"[FACE] Encoding comparison error: {str(e)}")
+        similarity = float(np.dot(emb1, emb2))
+        return round(max(-1.0, min(1.0, similarity)), 4)
+    except Exception as exc:
+        logger.error(f"[FACE] Embedding comparison error: {str(exc)}")
         return 0.0
 
 
 def get_confidence_label(confidence: float) -> str:
-    """
-    Get human-readable confidence label.
-    
-    Args:
-        confidence: Score 0.0-1.0
-    
-    Returns:
-        Label: "low", "medium", "high", or "very_high"
-    """
-    
+    """Get human-readable confidence label."""
+
     if confidence > 0.85:
         return "high"
     if confidence > 0.75:
@@ -288,172 +278,121 @@ def match_against_open_cases(sighting_encoding: bytes, db: Session, limit: int =
         similarity = compare_encodings(sighting_encoding, mp.face_encoding)
         logger.info(f"[FACE] case_id={mp.case_id} similarity_score={similarity:.4f}")
 
-        if similarity > 0.60:
-            results.append({
-                "case_id": mp.case_id,
-                "mp_id": mp.id,
-                "confidence": similarity,
-                "label": get_confidence_label(similarity),
-            })
+        if similarity > settings.FACE_REVIEW_THRESHOLD:
+            results.append(
+                {
+                    "case_id": mp.case_id,
+                    "mp_id": mp.id,
+                    "confidence": similarity,
+                    "label": get_confidence_label(similarity),
+                }
+            )
 
     results.sort(key=lambda x: x["confidence"], reverse=True)
     return results[:limit]
 
 
 def run_face_match(sighting_id: int, db: Session) -> List[Dict]:
-    """
-    Run face matching for a sighting against all open cases.
-    
-    Process:
-    1. Fetch sighting, mark as processing
-    2. Extract all missing persons with face encodings from open cases
-    3. Compare faces, collect matches above FACE_REVIEW_THRESHOLD (0.55)
-    4. Auto-confirm if confidence >= FACE_AUTO_THRESHOLD (0.85)
-    5. Create Match records + Alerts + update Case status
-    6. Return match results
-    
-    Args:
-        sighting_id: ID of sighting to match
-        db: Database session
-    
-    Returns:
-        List of match results (top 5):
-        [{
-            "case_id": int,
-            "mp_id": int,
-            "confidence": float,
-            "label": str,
-            "auto_confirmed": bool
-        }]
-    """
-    
-    if not FACE_RECOGNITION_AVAILABLE:
-        logger.warning("[FACE] face_recognition library not available, skipping match")
+    """Run face matching for a sighting against all open cases."""
+
+    if not FACE_ENGINE_AVAILABLE:
+        logger.warning("[FACE] DeepFace library not available, skipping match")
         return []
-    
+
     try:
-        # Fetch sighting
         sighting = db.query(Sighting).filter(Sighting.id == sighting_id).first()
-        
+
         if not sighting:
             logger.error(f"[FACE] Sighting {sighting_id} not found")
             return []
-        
-        # Check if face encoding exists
+
         if not sighting.face_encoding:
-            logger.info(f"[FACE] Sighting {sighting_id} has no face encoding")
+            logger.info(f"[FACE] Sighting {sighting_id} has no embedding")
             sighting.status = "no_face"
             db.commit()
             return []
-        
-        # Mark as processing
+
         sighting.status = "processing"
         db.commit()
-        
-        logger.info(f"[FACE] Matching sighting {sighting_id} against open cases")
-        
-        # Fetch all missing persons from open cases with face encodings
-        missing_persons = db.query(MissingPerson).join(
-            Case, MissingPerson.case_id == Case.id
-        ).filter(
-            Case.status == "open",
-            MissingPerson.face_encoding.isnot(None)
-        ).all()
-        
-        logger.info(f"[FACE] Found {len(missing_persons)} open cases with face encodings")
-        
+
+        missing_persons = (
+            db.query(MissingPerson)
+            .join(Case, MissingPerson.case_id == Case.id)
+            .filter(Case.status == "open", MissingPerson.face_encoding.isnot(None))
+            .all()
+        )
+
         results = []
-        
-        # Compare against each missing person
+
         for mp in missing_persons:
             try:
                 confidence = compare_encodings(sighting.face_encoding, mp.face_encoding)
-                logger.info(
-                    f"[FACE] Similarity sighting={sighting_id} vs case={mp.case_id} mp={mp.id}: {confidence:.4f}"
-                )
-                
                 if confidence >= settings.FACE_REVIEW_THRESHOLD:
-                    label = get_confidence_label(confidence)
-                    results.append({
-                        "case_id": mp.case_id,
-                        "mp_id": mp.id,
-                        "confidence": confidence,
-                        "label": label
-                    })
-                    
-                    logger.info(f"[FACE] Match found: Case {mp.case_id}, confidence {confidence:.2%}")
-            
-            except Exception as e:
-                logger.error(f"[FACE] Error comparing with MP {mp.id}: {str(e)}")
+                    results.append(
+                        {
+                            "case_id": mp.case_id,
+                            "mp_id": mp.id,
+                            "confidence": confidence,
+                            "label": get_confidence_label(confidence),
+                        }
+                    )
+            except Exception as exc:
+                logger.error(f"[FACE] Error comparing with MP {mp.id}: {str(exc)}")
                 continue
-        
-        # Sort by confidence descending, keep top 5
+
         results.sort(key=lambda x: x["confidence"], reverse=True)
         results = results[:5]
-        
-        # Create Match records and handle auto-confirm logic
-        for r in results:
+
+        for result in results:
             try:
-                match_type = "auto" if r["confidence"] >= settings.FACE_AUTO_THRESHOLD else "review"
+                match_type = "auto" if result["confidence"] >= settings.FACE_AUTO_THRESHOLD else "review"
                 status = "auto_confirmed" if match_type == "auto" else "pending"
-                
-                # Create Match record
+
                 match = Match(
-                    case_id=r["case_id"],
+                    case_id=result["case_id"],
                     sighting_id=sighting_id,
-                    confidence=r["confidence"],
-                    confidence_label=r["label"],
+                    confidence=result["confidence"],
+                    confidence_label=result["label"],
                     match_type=match_type,
-                    status=status
+                    status=status,
                 )
                 db.add(match)
-                
-                logger.info(f"[FACE] Created {match_type} Match for Case {r['case_id']}")
-                
-                # If auto-confirm, update case and create alert
+
                 if match_type == "auto":
-                    case = db.query(Case).filter(Case.id == r["case_id"]).first()
+                    case = db.query(Case).filter(Case.id == result["case_id"]).first()
                     if case:
                         case.status = "matched"
                         case.priority = "critical"
-                        
-                        # Get missing person name
-                        mp = db.query(MissingPerson).filter(MissingPerson.id == r["mp_id"]).first()
+
+                        mp = db.query(MissingPerson).filter(MissingPerson.id == result["mp_id"]).first()
                         mp_name = mp.full_name if mp else "Unknown"
-                        
-                        # Create alert
+
                         alert = Alert(
-                            case_id=r["case_id"],
+                            case_id=result["case_id"],
                             match_id=match.id,
                             alert_type="match_found",
                             recipient_type="all",
-                            message=f"AUTO MATCH {r['confidence']*100:.0f}%: {mp_name} — {sighting.city or 'Unknown city'}"
+                            message=f"AUTO MATCH {result['confidence']*100:.0f}%: {mp_name} — {sighting.sighting_city or 'Unknown city'}",
                         )
                         db.add(alert)
-                        
-                        logger.info(f"[FACE] Auto-match confirmed for Case {r['case_id']}, alert created")
-                
+
                 db.flush()
-            
-            except Exception as e:
-                logger.error(f"[FACE] Error creating match for Case {r['case_id']}: {str(e)}")
+            except Exception as exc:
+                logger.error(f"[FACE] Error creating match for Case {result['case_id']}: {str(exc)}")
                 continue
-        
-        # Update sighting status based on results
+
         sighting.status = "matched" if results else "no_match"
         db.commit()
-        
-        logger.info(f"[FACE] Sighting {sighting_id} matching complete, found {len(results)} matches")
-        
+
         return results
-    
-    except Exception as e:
-        logger.error(f"[FACE] Critical error in face matching: {str(e)}")
+
+    except Exception as exc:
+        logger.error(f"[FACE] Critical error in face matching: {str(exc)}")
         try:
             sighting = db.query(Sighting).filter(Sighting.id == sighting_id).first()
             if sighting:
                 sighting.status = "error"
                 db.commit()
-        except:
+        except Exception:
             pass
         return []

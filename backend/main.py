@@ -206,8 +206,8 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origins_list(),
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization"],
 )
 
 
@@ -361,21 +361,13 @@ def health_check():
         "timestamp": datetime.utcnow().isoformat()
     }
 
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# Auth Routes
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-@app.post("/auth/register", response_model=AuthResponse, tags=["Auth"])
-def register(request: RegisterRequest, db: Session = Depends(get_db)):
-    """Register a new user."""
-    existing_user = db.query(User).filter(User.email == request.email).first()
-    if existing_user:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Email already registered"
-        )
-    
+        # Keep this endpoint lightweight for frontend UX and to avoid gateway timeouts.
+        # Deep validation happens in /cases and /sightings during actual submission.
+        from PIL import Image
+        try:
+            Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        except Exception:
+            return {"is_person": False, "confidence": 0.0}
     new_user = User(
         name=request.name,
         email=request.email,
@@ -384,10 +376,6 @@ def register(request: RegisterRequest, db: Session = Depends(get_db)):
         role="user",
         is_active=True
     )
-    db.add(new_user)
-    db.commit()
-    db.refresh(new_user)
-    
     token = create_token(new_user.id, new_user.role)
     
     return AuthResponse(
@@ -441,15 +429,8 @@ def validate_photo(
         image_bytes = prepare_image_bytes_for_processing(image.file)
         log_memory_snapshot("validate_photo:prepared")
 
-        # Use face encoding detector when available.
-        if is_face_engine_available():
-            encoding = extract_encoding(image_bytes)
-            if encoding:
-                return {"is_person": True, "confidence": 0.92}
-            return {"is_person": False, "confidence": 0.28}
-
-        # Fallback mode: if detection model is unavailable, ensure image is decodable
-        # and allow submission with medium confidence instead of blocking all uploads.
+        # Keep this endpoint lightweight to avoid model-load spikes and gateway timeouts.
+        # Final face matching validation still happens in case/sighting submission endpoints.
         try:
             from PIL import Image
             Image.open(io.BytesIO(image_bytes)).convert("RGB")

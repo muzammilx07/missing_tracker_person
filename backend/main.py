@@ -18,6 +18,7 @@ import logging
 import hashlib
 import time
 import gc
+from PIL import Image
 
 from config import settings
 from database import engine, get_db, Base, SessionLocal
@@ -361,13 +362,17 @@ def health_check():
         "timestamp": datetime.utcnow().isoformat()
     }
 
-        # Keep this endpoint lightweight for frontend UX and to avoid gateway timeouts.
-        # Deep validation happens in /cases and /sightings during actual submission.
-        from PIL import Image
-        try:
-            Image.open(io.BytesIO(image_bytes)).convert("RGB")
-        except Exception:
-            return {"is_person": False, "confidence": 0.0}
+
+@app.post("/auth/register", response_model=AuthResponse, tags=["Auth"])
+def register(request: RegisterRequest, db: Session = Depends(get_db)):
+    """Register a new user."""
+    existing_user = db.query(User).filter(User.email == request.email).first()
+    if existing_user:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Email already registered"
+        )
+
     new_user = User(
         name=request.name,
         email=request.email,
@@ -376,8 +381,12 @@ def health_check():
         role="user",
         is_active=True
     )
+    db.add(new_user)
+    db.commit()
+    db.refresh(new_user)
+
     token = create_token(new_user.id, new_user.role)
-    
+
     return AuthResponse(
         id=new_user.id,
         name=new_user.name,
@@ -432,7 +441,6 @@ def validate_photo(
         # Keep this endpoint lightweight to avoid model-load spikes and gateway timeouts.
         # Final face matching validation still happens in case/sighting submission endpoints.
         try:
-            from PIL import Image
             Image.open(io.BytesIO(image_bytes)).convert("RGB")
         except Exception:
             return {"is_person": False, "confidence": 0.0}

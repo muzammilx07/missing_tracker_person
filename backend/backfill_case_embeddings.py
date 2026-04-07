@@ -2,7 +2,7 @@ import requests
 
 from database import SessionLocal
 from models import MissingPerson
-from services.face_service import extract_encoding, FACE_ENGINE_AVAILABLE
+from services.face_service import extract_encoding, is_face_engine_available
 
 
 def main() -> None:
@@ -10,7 +10,7 @@ def main() -> None:
     updated = 0
     failed = 0
 
-    print(f"face_model_available={FACE_ENGINE_AVAILABLE}")
+    print(f"face_model_available={is_face_engine_available()}")
 
     rows = (
         db.query(MissingPerson)

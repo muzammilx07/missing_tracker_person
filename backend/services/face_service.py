@@ -15,12 +15,9 @@ import numpy as np
 from PIL import Image
 from sqlalchemy.orm import Session
 
-try:
-    from deepface import DeepFace
-    FACE_ENGINE_AVAILABLE = True
-except ImportError as exc:
-    FACE_ENGINE_AVAILABLE = False
-    print(f"[FACE] WARNING: DeepFace not available: {str(exc)}")
+_DeepFace = None
+_FACE_ENGINE_IMPORT_ERROR: Optional[str] = None
+_DEEPFACE_IMPORT_LOCK = threading.Lock()
 
 from config import settings
 from models import Alert, Case, Match, MissingPerson, Sighting
@@ -38,6 +35,40 @@ _MODELS_WARMED = False
 
 if not tracemalloc.is_tracing():
     tracemalloc.start(25)
+
+
+def _load_deepface():
+    """Lazily import DeepFace and cache the module to avoid stale startup failures."""
+
+    global _DeepFace
+    global _FACE_ENGINE_IMPORT_ERROR
+
+    if _DeepFace is not None:
+        return _DeepFace
+
+    with _DEEPFACE_IMPORT_LOCK:
+        if _DeepFace is not None:
+            return _DeepFace
+        try:
+            from deepface import DeepFace as _DeepFaceModule  # pyright: ignore[reportMissingImports]
+
+            _DeepFace = _DeepFaceModule
+            _FACE_ENGINE_IMPORT_ERROR = None
+            return _DeepFace
+        except Exception as exc:
+            _FACE_ENGINE_IMPORT_ERROR = str(exc)
+            logger.warning(f"[FACE] DeepFace not available: {_FACE_ENGINE_IMPORT_ERROR}")
+            return None
+
+
+def is_face_engine_available() -> bool:
+    return _load_deepface() is not None
+
+
+def face_engine_unavailable_reason() -> str:
+    if is_face_engine_available():
+        return ""
+    return _FACE_ENGINE_IMPORT_ERROR or "DeepFace not installed"
 
 
 def log_memory_snapshot(stage: str) -> None:
@@ -103,7 +134,8 @@ def warmup_face_models() -> None:
 
     global _MODELS_WARMED
 
-    if not FACE_ENGINE_AVAILABLE or _MODELS_WARMED:
+    deepface_module = _load_deepface()
+    if deepface_module is None or _MODELS_WARMED:
         return
 
     with _MODEL_WARMUP_LOCK:
@@ -111,7 +143,7 @@ def warmup_face_models() -> None:
             return
         try:
             sample = np.zeros((64, 64, 3), dtype=np.uint8)
-            DeepFace.represent(
+            deepface_module.represent(
                 img_path=sample,
                 model_name=FACE_MODEL_NAME,
                 detector_backend="opencv",
@@ -125,7 +157,11 @@ def warmup_face_models() -> None:
 
 def _pick_largest_face(image_array: np.ndarray) -> Optional[np.ndarray]:
     """Return the largest detected face crop from an image."""
-    faces = DeepFace.extract_faces(
+    deepface_module = _load_deepface()
+    if deepface_module is None:
+        return None
+
+    faces = deepface_module.extract_faces(
         img_path=image_array,
         detector_backend="opencv",
         enforce_detection=False,
@@ -152,8 +188,9 @@ def _pick_largest_face(image_array: np.ndarray) -> Optional[np.ndarray]:
 def extract_encoding(image_bytes: bytes) -> Optional[bytes]:
     """Extract a normalized face embedding from image bytes using DeepFace."""
 
-    if not FACE_ENGINE_AVAILABLE:
-        logger.warning("[FACE] DeepFace library not available")
+    deepface_module = _load_deepface()
+    if deepface_module is None:
+        logger.warning(f"[FACE] DeepFace library not available: {face_engine_unavailable_reason()}")
         return None
 
     try:
@@ -170,7 +207,7 @@ def extract_encoding(image_bytes: bytes) -> Optional[bytes]:
                 logger.info("[FACE] No face detected in image")
                 return None
 
-            representations = DeepFace.represent(
+            representations = deepface_module.represent(
                 img_path=selected_face,
                 model_name=FACE_MODEL_NAME,
                 detector_backend="skip",
@@ -225,8 +262,8 @@ def extract_encoding(image_bytes: bytes) -> Optional[bytes]:
 def compare_encodings(enc1_bytes: bytes, enc2_bytes: bytes) -> float:
     """Compare two stored embeddings with cosine similarity."""
 
-    if not FACE_ENGINE_AVAILABLE:
-        logger.warning("[FACE] DeepFace library not available")
+    if not is_face_engine_available():
+        logger.warning(f"[FACE] DeepFace library not available: {face_engine_unavailable_reason()}")
         return 0.0
 
     try:
@@ -292,8 +329,8 @@ def match_against_open_cases(sighting_encoding: bytes, db: Session, limit: int =
 def run_face_match(sighting_id: int, db: Session) -> List[Dict]:
     """Run face matching for a sighting against all open cases."""
 
-    if not FACE_ENGINE_AVAILABLE:
-        logger.warning("[FACE] DeepFace library not available, skipping match")
+    if not is_face_engine_available():
+        logger.warning(f"[FACE] DeepFace library not available, skipping match: {face_engine_unavailable_reason()}")
         return []
 
     try:

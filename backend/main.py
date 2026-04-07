@@ -34,9 +34,9 @@ from services import (
     extract_encoding, compare_encodings, run_face_match, get_confidence_label, match_against_open_cases,
     generate_fir_pdf, get_alert_recipients, log_alert, notify_match_found,
     notify_fir_sent, notify_case_opened, prepare_image_bytes_for_processing,
-    log_memory_snapshot, warmup_face_models
+    log_memory_snapshot, warmup_face_models, is_face_engine_available,
+    face_engine_unavailable_reason
 )
-from services.face_service import FACE_ENGINE_AVAILABLE
 
 logger = logging.getLogger(__name__)
 
@@ -441,7 +441,7 @@ def validate_photo(
         log_memory_snapshot("validate_photo:prepared")
 
         # Use face encoding detector when available.
-        if FACE_ENGINE_AVAILABLE:
+        if is_face_engine_available():
             encoding = extract_encoding(image_bytes)
             if encoding:
                 return {"is_person": True, "confidence": 0.92}
@@ -524,8 +524,9 @@ def create_case(
     """
     
     try:
-        if not FACE_ENGINE_AVAILABLE:
-            raise HTTPException(status_code=503, detail="Face recognition model not available")
+        if not is_face_engine_available():
+            reason = face_engine_unavailable_reason() or "Face recognition model not available"
+            raise HTTPException(status_code=503, detail=f"Face recognition model not available: {reason}")
 
         # Validate and preprocess to memory-efficient size before any heavy operation.
         photo_bytes = prepare_image_bytes_for_processing(photo.file)
@@ -1002,8 +1003,9 @@ def create_sighting(
     """
     
     try:
-        if not FACE_ENGINE_AVAILABLE:
-            raise HTTPException(status_code=503, detail="Face recognition model not available")
+        if not is_face_engine_available():
+            reason = face_engine_unavailable_reason() or "Face recognition model not available"
+            raise HTTPException(status_code=503, detail=f"Face recognition model not available: {reason}")
 
         photo_bytes = prepare_image_bytes_for_processing(photo.file)
         log_memory_snapshot("create_sighting:prepared")
@@ -2113,8 +2115,9 @@ def test_match(
     image_b: UploadFile = File(...),
 ):
     """Test endpoint: compare two uploaded images using the same face pipeline."""
-    if not FACE_ENGINE_AVAILABLE:
-        raise HTTPException(status_code=503, detail="Face recognition model not available")
+    if not is_face_engine_available():
+        reason = face_engine_unavailable_reason() or "Face recognition model not available"
+        raise HTTPException(status_code=503, detail=f"Face recognition model not available: {reason}")
 
     bytes_a = image_a.file.read()
     bytes_b = image_b.file.read()

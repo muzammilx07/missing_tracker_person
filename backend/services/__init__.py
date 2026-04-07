@@ -11,6 +11,8 @@ from .face_service import (
     prepare_image_bytes_for_processing,
     log_memory_snapshot,
     warmup_face_models,
+    is_face_engine_available,
+    face_engine_unavailable_reason,
 )
 from .fir_service import generate_fir_pdf
 from .alert_service import (
@@ -32,6 +34,8 @@ __all__ = [
     "prepare_image_bytes_for_processing",
     "log_memory_snapshot",
     "warmup_face_models",
+    "is_face_engine_available",
+    "face_engine_unavailable_reason",
     "generate_fir_pdf",
     "get_alert_recipients",
     "log_alert",

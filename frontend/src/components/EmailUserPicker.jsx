@@ -11,7 +11,7 @@ import {
   CommandItem,
   CommandList,
 } from "@/components/ui/command";
-
+//exporting default function
 export default function EmailUserPicker({ selectedUsers, onSelectUser, onRemoveUser }) {
   const [query, setQuery] = useState("");
   const [results, setResults] = useState([]);

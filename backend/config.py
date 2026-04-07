@@ -1,6 +1,6 @@
 from pydantic_settings import BaseSettings
 from pydantic import ConfigDict
-from typing import Optional
+from typing import Optional, List
 
 
 class Settings(BaseSettings):
@@ -37,6 +37,13 @@ class Settings(BaseSettings):
     # Database
     DATABASE_URL: str = "sqlite:///./tracker.db"
     DIRECT_URL: Optional[str] = None  # Supabase direct URL for migrations
+
+    # CORS
+    CORS_ORIGINS: str = "http://localhost:3000,https://missing-tracker-person.onrender.com"
+
+    def cors_origins_list(self) -> List[str]:
+        """Parse comma-separated CORS origins into a clean list."""
+        return [origin.strip() for origin in self.CORS_ORIGINS.split(",") if origin.strip()]
 
 
 settings = Settings()

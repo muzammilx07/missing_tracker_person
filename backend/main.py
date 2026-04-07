@@ -17,6 +17,7 @@ import uuid
 import logging
 import hashlib
 import time
+import gc
 
 from config import settings
 from database import engine, get_db, Base, SessionLocal
@@ -32,7 +33,8 @@ from services import (
     upload_photo, reverse_geocode, geocode_address, find_police_stations,
     extract_encoding, run_face_match, get_confidence_label, match_against_open_cases,
     generate_fir_pdf, get_alert_recipients, log_alert, notify_match_found,
-    notify_fir_sent, notify_case_opened
+    notify_fir_sent, notify_case_opened, prepare_image_bytes_for_processing,
+    log_memory_snapshot, warmup_face_models
 )
 from services.face_service import FACE_RECOGNITION_AVAILABLE
 from services.face_service import compare_encodings
@@ -148,6 +150,9 @@ async def lifespan(app: FastAPI):
     # Create all tables
     Base.metadata.create_all(bind=engine)
     print("✓ Database tables created")
+
+    # Warm face models once to avoid first-request overhead and memory spikes.
+    warmup_face_models()
     
     # Check if admin exists, create if not
     db = SessionLocal()
@@ -196,10 +201,10 @@ app = FastAPI(
     lifespan=lifespan
 )
 
-# CORS - Allow all origins for development
+# CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=settings.cors_origins_list(),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -433,7 +438,8 @@ def validate_photo(
 ):
     """Validate whether uploaded photo appears to contain a person face."""
     try:
-        image_bytes = image.file.read()
+        image_bytes = prepare_image_bytes_for_processing(image.file)
+        log_memory_snapshot("validate_photo:prepared")
 
         # Use face encoding detector when available.
         if FACE_RECOGNITION_AVAILABLE:
@@ -453,6 +459,17 @@ def validate_photo(
         return {"is_person": True, "confidence": 0.61}
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid image: {str(e)}")
+    finally:
+        try:
+            del image_bytes
+        except Exception:
+            pass
+        try:
+            del encoding
+        except Exception:
+            pass
+        gc.collect()
+        log_memory_snapshot("validate_photo:done")
 
 
 @app.get("/users/search", tags=["Users"])
@@ -511,8 +528,9 @@ def create_case(
         if not FACE_RECOGNITION_AVAILABLE:
             raise HTTPException(status_code=503, detail="Face recognition model not available")
 
-        # Read photo bytes
-        photo_bytes = photo.file.read()
+        # Validate and preprocess to memory-efficient size before any heavy operation.
+        photo_bytes = prepare_image_bytes_for_processing(photo.file)
+        log_memory_snapshot("create_case:prepared")
         
         # Upload to Cloudinary
         try:
@@ -532,6 +550,7 @@ def create_case(
                 status_code=400,
                 detail="No face detected in uploaded photo. Please upload a clear face image."
             )
+        log_memory_snapshot("create_case:encoded")
         
         # Geocode address if provided
         lat, lng = None, None
@@ -590,6 +609,17 @@ def create_case(
         logger.error(f"Error creating case: {str(e)}")
         db.rollback()
         raise HTTPException(status_code=500, detail=f"Error creating case: {str(e)}")
+    finally:
+        try:
+            del photo_bytes
+        except Exception:
+            pass
+        try:
+            del face_encoding
+        except Exception:
+            pass
+        gc.collect()
+        log_memory_snapshot("create_case:done")
 
 
 @app.get("/cases", response_model=Dict, tags=["Cases"])
@@ -976,8 +1006,8 @@ def create_sighting(
         if not FACE_RECOGNITION_AVAILABLE:
             raise HTTPException(status_code=503, detail="Face recognition model not available")
 
-        # Read photo bytes
-        photo_bytes = photo.file.read()
+        photo_bytes = prepare_image_bytes_for_processing(photo.file)
+        log_memory_snapshot("create_sighting:prepared")
 
         client_ip = request.client.host if request.client else "unknown"
         client_key = f"{client_ip}:{(reporter_phone or '').strip()}"
@@ -990,6 +1020,7 @@ def create_sighting(
                 status_code=400,
                 detail="No face detected"
             )
+        log_memory_snapshot("create_sighting:encoded")
 
         # STEP 3+4+5: compare against all existing case embeddings via cosine similarity.
         matches = match_against_open_cases(face_encoding, db)
@@ -1063,6 +1094,7 @@ def create_sighting(
         )
 
         db.commit()
+        log_memory_snapshot("create_sighting:committed")
 
         return {
             "sighting_id": sighting_id,
@@ -1081,6 +1113,21 @@ def create_sighting(
         logger.error(f"Error creating sighting: {str(e)}")
         db.rollback()
         raise HTTPException(status_code=500, detail=f"Error creating sighting: {str(e)}")
+    finally:
+        try:
+            del photo_bytes
+        except Exception:
+            pass
+        try:
+            del face_encoding
+        except Exception:
+            pass
+        try:
+            del matches
+        except Exception:
+            pass
+        gc.collect()
+        log_memory_snapshot("create_sighting:done")
 
 
 @app.get("/sightings", tags=["Sightings"])

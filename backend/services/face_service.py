@@ -9,7 +9,10 @@ On Linux: May need: apt-get install cmake, then pip install dlib face_recognitio
 
 import pickle
 import logging
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, BinaryIO
+import gc
+import threading
+import tracemalloc
 from sqlalchemy.orm import Session
 import numpy as np
 
@@ -28,6 +31,99 @@ from models import Sighting, MissingPerson, Match, Case, Alert
 
 logger = logging.getLogger(__name__)
 
+MAX_UPLOAD_BYTES = 5 * 1024 * 1024
+MAX_INPUT_DIMENSION = 2000
+PROCESSING_MAX_DIMENSION = 640
+
+_FACE_PROCESSING_SEMAPHORE = threading.BoundedSemaphore(value=1)
+_MODEL_WARMUP_LOCK = threading.Lock()
+_MODELS_WARMED = False
+
+if not tracemalloc.is_tracing():
+    tracemalloc.start(25)
+
+
+def log_memory_snapshot(stage: str) -> None:
+    """Log current and peak Python memory usage for face-processing telemetry."""
+    try:
+        current, peak = tracemalloc.get_traced_memory()
+        logger.info(
+            "[MEM] stage=%s current_mb=%.2f peak_mb=%.2f",
+            stage,
+            current / (1024 * 1024),
+            peak / (1024 * 1024),
+        )
+    except Exception:
+        # Memory telemetry must never interrupt request handling.
+        pass
+
+
+def prepare_image_bytes_for_processing(file_obj: BinaryIO) -> bytes:
+    """Validate and resize uploaded image into a compact RGB JPEG byte buffer."""
+
+    if not FACE_RECOGNITION_AVAILABLE:
+        raise ValueError("Face recognition dependencies are unavailable")
+
+    try:
+        file_obj.seek(0, 2)
+        size_bytes = file_obj.tell()
+        file_obj.seek(0)
+    except Exception:
+        size_bytes = None
+
+    if size_bytes is not None and size_bytes > MAX_UPLOAD_BYTES:
+        raise ValueError("Image is too large. Maximum allowed size is 5MB")
+
+    try:
+        image = Image.open(file_obj)
+    except Exception as exc:
+        raise ValueError(f"Invalid image file: {str(exc)}")
+
+    try:
+        width, height = image.size
+        if max(width, height) > MAX_INPUT_DIMENSION:
+            raise ValueError("Image dimensions too large. Maximum allowed dimension is 2000px")
+
+        if image.mode != "RGB":
+            image = image.convert("RGB")
+
+        if max(image.size) > PROCESSING_MAX_DIMENSION:
+            image.thumbnail((PROCESSING_MAX_DIMENSION, PROCESSING_MAX_DIMENSION), Image.Resampling.BILINEAR)
+
+        optimized = io.BytesIO()
+        image.save(optimized, format="JPEG", quality=85, optimize=True)
+        prepared_bytes = optimized.getvalue()
+    finally:
+        try:
+            image.close()
+        except Exception:
+            pass
+
+    if len(prepared_bytes) > MAX_UPLOAD_BYTES:
+        raise ValueError("Image is too large after processing. Please upload a smaller image")
+
+    return prepared_bytes
+
+
+def warmup_face_models() -> None:
+    """Warm dlib/face_recognition models once to avoid first-request memory spikes."""
+
+    global _MODELS_WARMED
+
+    if not FACE_RECOGNITION_AVAILABLE or _MODELS_WARMED:
+        return
+
+    with _MODEL_WARMUP_LOCK:
+        if _MODELS_WARMED:
+            return
+        try:
+            sample = np.zeros((32, 32, 3), dtype=np.uint8)
+            face_recognition.face_locations(sample, number_of_times_to_upsample=0, model="hog")
+            _MODELS_WARMED = True
+            logger.info("[FACE] Model warmup complete")
+        except Exception as exc:
+            logger.warning(f"[FACE] Model warmup skipped: {str(exc)}")
+
 
 def extract_encoding(image_bytes: bytes) -> Optional[bytes]:
     """
@@ -43,59 +139,80 @@ def extract_encoding(image_bytes: bytes) -> Optional[bytes]:
     if not FACE_RECOGNITION_AVAILABLE:
         logger.warning("[FACE] face_recognition library not available")
         return None
-    
+
     try:
-        # Load image from bytes
-        image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        log_memory_snapshot("extract:start")
 
-        # Keep a consistent input scale for case and sighting pipelines.
-        max_side = 1024
-        if max(image.size) > max_side:
-            image.thumbnail((max_side, max_side))
+        with _FACE_PROCESSING_SEMAPHORE:
+            image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+            if max(image.size) > PROCESSING_MAX_DIMENSION:
+                image.thumbnail((PROCESSING_MAX_DIMENSION, PROCESSING_MAX_DIMENSION), Image.Resampling.BILINEAR)
 
-        image_array = np.array(image)
+            image_array = np.asarray(image, dtype=np.uint8)
 
-        # Detect faces with fallback passes for hard images.
-        face_locations = face_recognition.face_locations(image_array, number_of_times_to_upsample=1, model="hog")
-        if not face_locations:
-            face_locations = face_recognition.face_locations(image_array, number_of_times_to_upsample=2, model="hog")
-        
-        if not face_locations:
-            logger.info("[FACE] No face detected in image")
-            return None
-        
-        # If multiple faces, pick largestalea by area
-        if len(face_locations) > 1:
-            best_location = max(
-                face_locations,
-                key=lambda loc: (loc[2] - loc[0]) * (loc[1] - loc[3])
+            # Single-pass detection with HOG and no upscaling avoids large temporary allocations.
+            face_locations = face_recognition.face_locations(
+                image_array,
+                number_of_times_to_upsample=0,
+                model="hog",
             )
-            logger.info(f"[FACE] Multiple faces found, using largest of {len(face_locations)}")
-        else:
-            best_location = face_locations[0]
-        
-        # Extract encoding
-        encodings = face_recognition.face_encodings(image_array, [best_location])
-        
-        if not encodings:
-            logger.warning("[FACE] Could not extract encoding from face")
-            return None
-        
-        encoding = np.array(encodings[0], dtype=np.float32)
 
-        # Normalize to keep embedding scale consistent across all comparisons.
-        norm = np.linalg.norm(encoding)
-        if norm == 0:
-            logger.warning("[FACE] Invalid zero-norm embedding")
-            return None
-        encoding = encoding / norm
-        
-        # Pickle and return
-        return pickle.dumps(encoding)
+            if not face_locations:
+                logger.info("[FACE] No face detected in image")
+                return None
+
+            if len(face_locations) > 1:
+                best_location = max(
+                    face_locations,
+                    key=lambda loc: (loc[2] - loc[0]) * (loc[1] - loc[3]),
+                )
+                logger.info(f"[FACE] Multiple faces found, using largest of {len(face_locations)}")
+            else:
+                best_location = face_locations[0]
+
+            # Extract only one face encoding.
+            encodings = face_recognition.face_encodings(image_array, [best_location])
+
+            if not encodings:
+                logger.warning("[FACE] Could not extract encoding from face")
+                return None
+
+            encoding = np.asarray(encodings[0], dtype=np.float32)
+
+            norm = np.linalg.norm(encoding)
+            if norm == 0:
+                logger.warning("[FACE] Invalid zero-norm embedding")
+                return None
+            encoding = encoding / norm
+
+            return pickle.dumps(encoding)
     
     except Exception as e:
         logger.error(f"[FACE] Encoding extraction error: {str(e)}")
         return None
+    finally:
+        try:
+            del image
+        except Exception:
+            pass
+        try:
+            del image_array
+        except Exception:
+            pass
+        try:
+            del face_locations
+        except Exception:
+            pass
+        try:
+            del encodings
+        except Exception:
+            pass
+        try:
+            del encoding
+        except Exception:
+            pass
+        gc.collect()
+        log_memory_snapshot("extract:end")
 
 
 def compare_encodings(enc1_bytes: bytes, enc2_bytes: bytes) -> float:

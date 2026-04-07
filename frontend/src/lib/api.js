@@ -3,7 +3,7 @@ import { clearAuth, getToken } from "@/lib/auth";
 
 const baseURL =
   process.env.NEXT_PUBLIC_API_URL ||
-  "http://localhost:8000";
+  "https://missing-tracker-person.onrender.com";
 
 const api = axios.create({
   baseURL,

@@ -4,6 +4,7 @@ uvicorn[standard]==0.24.0
 Pillow==10.2.0
 numpy==1.26.4
 deepface==0.0.93
+tensorflow-cpu==2.15.1
 
 opencv-python-headless==4.9.0.80
 

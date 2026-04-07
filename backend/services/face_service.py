@@ -57,9 +57,6 @@ def log_memory_snapshot(stage: str) -> None:
 def prepare_image_bytes_for_processing(file_obj: BinaryIO) -> bytes:
     """Validate and resize uploaded image into a compact RGB JPEG byte buffer."""
 
-    if not FACE_ENGINE_AVAILABLE:
-        raise ValueError("DeepFace dependencies are unavailable")
-
     try:
         file_obj.seek(0, 2)
         size_bytes = file_obj.tell()

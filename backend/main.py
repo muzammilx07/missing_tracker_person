@@ -150,8 +150,9 @@ async def lifespan(app: FastAPI):
     Base.metadata.create_all(bind=engine)
     print("✓ Database tables created")
 
-    # Warm face models once to avoid first-request overhead and memory spikes.
-    warmup_face_models()
+    # Keep startup light on low-memory hosts; warmup is opt-in via env.
+    if settings.FACE_WARMUP_ON_STARTUP:
+        warmup_face_models()
     
     # Check if admin exists, create if not
     db = SessionLocal()

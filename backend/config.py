@@ -26,6 +26,8 @@ class Settings(BaseSettings):
     # Face Recognition Thresholds
     FACE_AUTO_THRESHOLD: float = 0.85  # High-confidence match
     FACE_REVIEW_THRESHOLD: float = 0.60  # Possible match threshold
+    FACE_MODEL_NAME: str = "Facenet"
+    FACE_WARMUP_ON_STARTUP: bool = False
 
     # Sighting persistence policy after matching
     STORE_MATCHED_SIGHTINGS: bool = True

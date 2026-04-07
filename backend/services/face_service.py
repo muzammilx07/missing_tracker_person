@@ -6,6 +6,7 @@ Handles face preprocessing, embedding extraction, and matching.
 import gc
 import io
 import logging
+import os
 import pickle
 import threading
 import tracemalloc
@@ -24,7 +25,15 @@ from models import Alert, Case, Match, MissingPerson, Sighting
 
 logger = logging.getLogger(__name__)
 
-FACE_MODEL_NAME = "Facenet"
+# Constrain thread fan-out from ML/native libs to keep RAM stable on small instances.
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+os.environ.setdefault("TF_NUM_INTRAOP_THREADS", "1")
+os.environ.setdefault("TF_NUM_INTEROP_THREADS", "1")
+
+FACE_MODEL_NAME = settings.FACE_MODEL_NAME
 MAX_UPLOAD_BYTES = 5 * 1024 * 1024
 MAX_INPUT_DIMENSION = 2000
 PROCESSING_MAX_DIMENSION = 640

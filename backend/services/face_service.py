@@ -2,7 +2,7 @@ import httpx
 import os
 import json
 
-ML_SERVICE_URL = os.environ.get("ML_SERVICE_URL", "")
+ML_SERVICE_URL = os.environ.get("ML_SERVICE_URL", "https://mas00m-missing-tracker-ml.hf.space")
 
 
 async def validate_photo(image_bytes: bytes) -> dict:

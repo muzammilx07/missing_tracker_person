@@ -32,6 +32,16 @@ def health():
     return {"status": "ok"}
 
 
+@app.get("/")
+def root():
+    return {
+        "service": "missing-tracker-ml",
+        "status": "ok",
+        "health": "/health",
+        "endpoints": ["/validate-photo", "/extract-embedding", "/compare-faces"],
+    }
+
+
 @app.post("/validate-photo")
 async def validate_photo(file: UploadFile = File(...)):
     image_bytes = await file.read()

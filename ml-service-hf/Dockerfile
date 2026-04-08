@@ -1,11 +1,12 @@
-FROM python:3.10-slim
+FROM python:3.10-bullseye
 
 RUN apt-get update && apt-get install -y \
-    cmake build-essential libopenblas-dev \
-    liblapack-dev libx11-dev libboost-all-dev \
-    ffmpeg libsm6 libxext6 wget
+    wget bzip2 ffmpeg libsm6 libxext6
 
 WORKDIR /app
+
+# Install prebuilt dlib wheel
+RUN pip install --no-cache-dir dlib==19.24.0
 
 # Download dlib model files during build
 RUN mkdir models && \

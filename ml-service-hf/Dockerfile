@@ -5,8 +5,9 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /app
 
-# Install prebuilt dlib wheel
-RUN pip install --no-cache-dir dlib==19.24.0
+# Install binary dlib build to avoid compiling from source on HF
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir dlib-bin==19.24.6
 
 # Download dlib model files during build
 RUN mkdir models && \

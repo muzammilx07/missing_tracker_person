@@ -18,7 +18,9 @@ import logging
 import hashlib
 import time
 import gc
-from PIL import Image
+import json
+import pickle
+import numpy as np
 
 from config import settings
 from database import engine, get_db, Base, SessionLocal
@@ -32,11 +34,8 @@ from auth import (
 )
 from services import (
     upload_photo, reverse_geocode, geocode_address, find_police_stations,
-    extract_encoding, compare_encodings, run_face_match, get_confidence_label, match_against_open_cases,
     generate_fir_pdf, get_alert_recipients, log_alert, notify_match_found,
-    notify_fir_sent, notify_case_opened, prepare_image_bytes_for_processing,
-    log_memory_snapshot, warmup_face_models, is_face_engine_available,
-    face_engine_unavailable_reason
+    notify_fir_sent, notify_case_opened, face_service
 )
 
 logger = logging.getLogger(__name__)
@@ -45,6 +44,53 @@ logger = logging.getLogger(__name__)
 # Lightweight in-memory anti-spam guard for public sighting submissions.
 _SIGHTING_RATE_LIMIT: Dict[str, List[float]] = {}
 _RECENT_IMAGE_FINGERPRINTS: Dict[str, float] = {}
+
+
+def _serialize_embedding(embedding: Optional[List[float]]) -> Optional[bytes]:
+    if embedding is None:
+        return None
+    return json.dumps(embedding).encode("utf-8")
+
+
+def _deserialize_embedding(embedding_bytes: Optional[bytes]) -> Optional[List[float]]:
+    if not embedding_bytes:
+        return None
+
+    # Prefer JSON for new records; keep pickle compatibility for old rows.
+    try:
+        decoded = embedding_bytes.decode("utf-8")
+        value = json.loads(decoded)
+        if isinstance(value, list):
+            return [float(x) for x in value]
+    except Exception:
+        pass
+
+    try:
+        value = pickle.loads(embedding_bytes)
+        if isinstance(value, list):
+            return [float(x) for x in value]
+        if isinstance(value, np.ndarray):
+            return [float(x) for x in value.tolist()]
+    except Exception:
+        return None
+
+    return None
+
+
+def _similarity_from_distance(distance: Optional[float]) -> float:
+    if distance is None:
+        return 0.0
+    return round(max(0.0, 1.0 - float(distance)), 4)
+
+
+def _confidence_label(confidence: float) -> str:
+    if confidence > 0.85:
+        return "high"
+    if confidence > 0.75:
+        return "medium"
+    if confidence > 0.60:
+        return "low"
+    return "none"
 
 
 def _enforce_sighting_rate_limit(client_key: str, image_bytes: bytes) -> None:
@@ -151,10 +197,6 @@ async def lifespan(app: FastAPI):
     Base.metadata.create_all(bind=engine)
     print("✓ Database tables created")
 
-    # Keep startup light on low-memory hosts; warmup is opt-in via env.
-    if settings.FACE_WARMUP_ON_STARTUP:
-        warmup_face_models()
-    
     # Check if admin exists, create if not
     db = SessionLocal()
     try:
@@ -205,10 +247,10 @@ app = FastAPI(
 # CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.cors_origins_list(),
+    allow_origins=["https://missing-tracker-person.vercel.app", "http://localhost:3000"],
     allow_credentials=True,
-    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-    allow_headers=["Content-Type", "Authorization"],
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 
@@ -430,35 +472,19 @@ def get_current_user_info(current_user: User = Depends(get_current_user)):
 
 
 @app.post("/ai/validate-photo", tags=["AI"])
-def validate_photo(
+async def validate_photo(
     image: UploadFile = File(...),
 ):
     """Validate whether uploaded photo appears to contain a person face."""
     try:
-        image_bytes = prepare_image_bytes_for_processing(image.file)
-        log_memory_snapshot("validate_photo:prepared")
-
-        # Keep this endpoint lightweight to avoid model-load spikes and gateway timeouts.
-        # Final face matching validation still happens in case/sighting submission endpoints.
-        try:
-            Image.open(io.BytesIO(image_bytes)).convert("RGB")
-        except Exception:
-            return {"is_person": False, "confidence": 0.0}
-
-        return {"is_person": True, "confidence": 0.61}
+        image_bytes = await image.read()
+        result = await face_service.validate_photo(image_bytes)
+        return {
+            "is_person": bool(result.get("is_person", False)),
+            "confidence": float(result.get("confidence", 0.0)),
+        }
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid image: {str(e)}")
-    finally:
-        try:
-            del image_bytes
-        except Exception:
-            pass
-        try:
-            del encoding
-        except Exception:
-            pass
-        gc.collect()
-        log_memory_snapshot("validate_photo:done")
 
 
 @app.get("/users/search", tags=["Users"])
@@ -490,7 +516,7 @@ def search_users(
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 @app.post("/cases", response_model=Dict, tags=["Cases"])
-def create_case(
+async def create_case(
     full_name: str = Form(...),
     age: Optional[int] = Form(None),
     gender: Optional[str] = Form(None),
@@ -514,13 +540,7 @@ def create_case(
     """
     
     try:
-        if not is_face_engine_available():
-            reason = face_engine_unavailable_reason() or "Face recognition model not available"
-            raise HTTPException(status_code=503, detail=f"Face recognition model not available: {reason}")
-
-        # Validate and preprocess to memory-efficient size before any heavy operation.
-        photo_bytes = prepare_image_bytes_for_processing(photo.file)
-        log_memory_snapshot("create_case:prepared")
+        photo_bytes = await photo.read()
         
         # Upload to Cloudinary
         try:
@@ -533,14 +553,13 @@ def create_case(
             logger.warning(f"Cloudinary upload failed, storing without URL: {str(e)}")
             photo_url = None
         
-        # Extract face encoding
-        face_encoding = extract_encoding(photo_bytes)
-        if not face_encoding:
+        embedding = await face_service.extract_embedding(photo_bytes)
+        if not embedding:
             raise HTTPException(
                 status_code=400,
                 detail="No face detected in uploaded photo. Please upload a clear face image."
             )
-        log_memory_snapshot("create_case:encoded")
+        face_encoding = _serialize_embedding(embedding)
         
         # Geocode address if provided
         lat, lng = None, None
@@ -608,8 +627,6 @@ def create_case(
             del face_encoding
         except Exception:
             pass
-        gc.collect()
-        log_memory_snapshot("create_case:done")
 
 
 @app.get("/cases", response_model=Dict, tags=["Cases"])
@@ -973,7 +990,7 @@ def get_case_realtime(
 
 @app.post("/sightings/upload", response_model=Dict, tags=["Sightings"])
 @app.post("/sightings", response_model=Dict, tags=["Sightings"])
-def create_sighting(
+async def create_sighting(
     request: Request,
     sighting_lat: float = Form(...),
     sighting_lng: float = Form(...),
@@ -993,28 +1010,50 @@ def create_sighting(
     """
     
     try:
-        if not is_face_engine_available():
-            reason = face_engine_unavailable_reason() or "Face recognition model not available"
-            raise HTTPException(status_code=503, detail=f"Face recognition model not available: {reason}")
-
-        photo_bytes = prepare_image_bytes_for_processing(photo.file)
-        log_memory_snapshot("create_sighting:prepared")
+        photo_bytes = await photo.read()
 
         client_ip = request.client.host if request.client else "unknown"
         client_key = f"{client_ip}:{(reporter_phone or '').strip()}"
         _enforce_sighting_rate_limit(client_key, photo_bytes)
 
-        # STEP 1+2: extract face and embedding with the same model used for cases.
-        face_encoding = extract_encoding(photo_bytes)
-        if not face_encoding:
-            raise HTTPException(
-                status_code=400,
-                detail="No face detected"
-            )
-        log_memory_snapshot("create_sighting:encoded")
+        matches = []
+        sighting_embedding: Optional[List[float]] = None
 
-        # STEP 3+4+5: compare against all existing case embeddings via cosine similarity.
-        matches = match_against_open_cases(face_encoding, db)
+        known_people = db.query(MissingPerson).join(
+            Case, MissingPerson.case_id == Case.id
+        ).filter(
+            Case.status == "open",
+            MissingPerson.face_encoding.isnot(None)
+        ).all()
+
+        for mp in known_people:
+            known_embedding = _deserialize_embedding(mp.face_encoding)
+            if not known_embedding:
+                continue
+
+            result = await face_service.compare_faces(photo_bytes, known_embedding)
+            if sighting_embedding is None and result.get("embedding"):
+                sighting_embedding = [float(x) for x in result.get("embedding")]
+
+            distance = result.get("distance")
+            confidence = _similarity_from_distance(distance)
+            if result.get("match"):
+                matches.append(
+                    {
+                        "case_id": mp.case_id,
+                        "mp_id": mp.id,
+                        "confidence": confidence,
+                        "label": _confidence_label(confidence),
+                    }
+                )
+
+        if sighting_embedding is None:
+            sighting_embedding = await face_service.extract_embedding(photo_bytes)
+        if not sighting_embedding:
+            raise HTTPException(status_code=400, detail="No face detected")
+
+        matches.sort(key=lambda x: x["confidence"], reverse=True)
+        face_encoding = _serialize_embedding(sighting_embedding)
         best_match = matches[0] if matches else None
         match_found = bool(best_match and best_match["confidence"] > settings.FACE_REVIEW_THRESHOLD)
 
@@ -1085,7 +1124,6 @@ def create_sighting(
         )
 
         db.commit()
-        log_memory_snapshot("create_sighting:committed")
 
         return {
             "sighting_id": sighting_id,
@@ -1117,8 +1155,6 @@ def create_sighting(
             del matches
         except Exception:
             pass
-        gc.collect()
-        log_memory_snapshot("create_sighting:done")
 
 
 @app.get("/sightings", tags=["Sightings"])
@@ -2063,7 +2099,7 @@ def create_alert(
 
 
 @app.post("/admin/reindex-case-embeddings", tags=["Admin"])
-def reindex_case_embeddings(
+async def reindex_case_embeddings(
     current_user: User = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
@@ -2082,7 +2118,8 @@ def reindex_case_embeddings(
         try:
             response = requests.get(mp.photo_url, timeout=25)
             response.raise_for_status()
-            encoding = extract_encoding(response.content)
+            embedding = await face_service.extract_embedding(response.content)
+            encoding = _serialize_embedding(embedding)
             if encoding:
                 mp.face_encoding = encoding
                 updated += 1
@@ -2100,25 +2137,20 @@ def reindex_case_embeddings(
 
 
 @app.post("/test-match", tags=["Testing"])
-def test_match(
+async def test_match(
     image_a: UploadFile = File(...),
     image_b: UploadFile = File(...),
 ):
     """Test endpoint: compare two uploaded images using the same face pipeline."""
-    if not is_face_engine_available():
-        reason = face_engine_unavailable_reason() or "Face recognition model not available"
-        raise HTTPException(status_code=503, detail=f"Face recognition model not available: {reason}")
+    bytes_a = await image_a.read()
+    bytes_b = await image_b.read()
 
-    bytes_a = image_a.file.read()
-    bytes_b = image_b.file.read()
-
-    enc_a = extract_encoding(bytes_a)
-    enc_b = extract_encoding(bytes_b)
-
-    if not enc_a or not enc_b:
+    known_embedding = await face_service.extract_embedding(bytes_a)
+    if not known_embedding:
         raise HTTPException(status_code=400, detail="No face detected")
 
-    similarity = compare_encodings(enc_a, enc_b)
+    result = await face_service.compare_faces(bytes_b, known_embedding)
+    similarity = _similarity_from_distance(result.get("distance"))
     return {
         "similarity": similarity,
         "passes_same_image_expectation": similarity > 0.9,

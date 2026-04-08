@@ -2,23 +2,12 @@
 
 from .cloudinary_service import upload_photo
 from .geo_service import reverse_geocode, geocode_address, find_police_stations, haversine
-from .face_service import (
-    extract_encoding,
-    compare_encodings,
-    run_face_match,
-    get_confidence_label,
-    match_against_open_cases,
-    prepare_image_bytes_for_processing,
-    log_memory_snapshot,
-    warmup_face_models,
-    is_face_engine_available,
-    face_engine_unavailable_reason,
-)
 from .fir_service import generate_fir_pdf
 from .alert_service import (
     get_alert_recipients, log_alert, notify_match_found, 
     notify_fir_sent, notify_case_opened
 )
+from . import face_service
 
 __all__ = [
     "upload_photo",
@@ -26,16 +15,7 @@ __all__ = [
     "geocode_address",
     "find_police_stations",
     "haversine",
-    "extract_encoding",
-    "compare_encodings",
-    "run_face_match",
-    "get_confidence_label",
-    "match_against_open_cases",
-    "prepare_image_bytes_for_processing",
-    "log_memory_snapshot",
-    "warmup_face_models",
-    "is_face_engine_available",
-    "face_engine_unavailable_reason",
+    "face_service",
     "generate_fir_pdf",
     "get_alert_recipients",
     "log_alert",
